@@ -8,7 +8,9 @@ HOME = Path.home()
 CONF = Path(os.environ.get("CONTINUITY_CONF", HOME / ".config/continuity"))
 STATE = Path(os.environ.get("CONTINUITY_STATE", HOME / ".local/state/continuity"))
 SELF = Path(__file__).resolve()
-DEFAULT_THRESHOLD = 70
+DEFAULT_THRESHOLD = 70          # percent, used only when the token threshold is off (0)
+DEFAULT_TOKENS = 400_000        # roll over to a new session once the context holds this many tokens
+PY = f'"{Path(sys.executable).as_posix()}" "{Path(__file__).resolve().as_posix()}"'  # real interpreter; `python3` is a Store stub on Windows
 STALE_LAUNCH_SEC = 600
 MAX_HANDOFF_WORDS = 400
 SECTIONS = ["Objective", "Latest user request", "Decisions", "Changed files",
@@ -31,7 +33,7 @@ def redact(t):
 
 def jload(p, d=None):
     try:
-        return json.loads(Path(p).read_text())
+        return json.loads(Path(p).read_text(encoding="utf-8"))
     except Exception:
         return d
 
@@ -39,7 +41,7 @@ def jload(p, d=None):
 def jsave(p, obj):
     p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(obj, indent=1)); os.replace(tmp, p)
+    tmp.write_text(json.dumps(obj, indent=1), encoding="utf-8"); os.replace(tmp, p)
 
 
 @contextlib.contextmanager
@@ -90,6 +92,15 @@ def threshold(b):
     return DEFAULT_THRESHOLD
 
 
+def token_limit(b):
+    """Absolute context-size trigger. Works in the Desktop app too (reads the transcript, no status line needed)."""
+    for v in (os.environ.get("CONTINUITY_TOKENS"), (b or {}).get("threshold_tokens"), gconf().get("threshold_tokens"), DEFAULT_TOKENS):
+        try:
+            if v is not None and float(v) >= 0: return float(v)
+        except ValueError: pass
+    return DEFAULT_TOKENS
+
+
 def enabled(b):
     if os.environ.get("CONTINUITY_OFF") == "1": return False
     return gconf().get("enabled", True) and (b or {}).get("enabled", True)
@@ -105,8 +116,12 @@ def sess_file(sid): return STATE / "sessions" / f"{re.sub(r'[^A-Za-z0-9_-]', '',
 def trans_file(pid): return STATE / "projects" / pid / "transition.json"
 
 
+def stdin_text():
+    return sys.stdin.buffer.read().decode("utf-8", "replace")  # Windows console default is cp1252
+
+
 def read_payload():
-    try: return json.loads(sys.stdin.read() or "{}")
+    try: return json.loads(stdin_text() or "{}")
     except Exception: return {}
 
 
@@ -117,7 +132,7 @@ def out_ctx(event, text):
 def session_title(tr):
     t = None
     try:
-        with open(tr, errors="replace") as f:
+        with open(tr, encoding="utf-8", errors="replace") as f:
             for l in f:
                 if '"custom-title"' in l:
                     with contextlib.suppress(Exception): t = json.loads(l).get("customTitle") or t
@@ -140,15 +155,27 @@ def cmd_tap(a):
     jsave(f, s)
 
 
-def checkpoint_text(s, thr, b):
-    pct = int(round(s.get("pct") or 0))
+def checkpoint_text(s, b, reason=None):
     title = session_title(s.get("tr") or "") or "<exact current session title>"
-    bound = "" if b else ("Project has no Obsidian destination yet: follow SKILL.md 'First use' and ask once. ")
-    return (f"[continuity] Context {pct}% >= {thr:g}%. {bound}Finish the current safe unit of work. "
+    if reason is None:
+        reason = f"{int(s['tokens']):,} tokens" if s.get("tokens") else f"{int(round(s.get('pct') or 0))}%"
+    return (f"[continuity] Context is at {reason}: automatic rollover to a new session (the user set this up). "
+            f"Do it now without asking. Finish the current safe unit of work (do not start new work). "
             f"If only the final reply remains, finish here and write nothing. Otherwise: write a 150-300 word handoff "
             f"(latest user request, decisive evidence, untested items, running operations by id, ONE next action) and run "
-            f"`python3 {SELF} handoff --title \"{title}\"` with the text on stdin; then run "
-            f"`python3 {SELF} launch --sid {s['sid']}` and follow its output. Both commands are idempotent; do this once.")
+            f"`{PY} handoff --sid {s['sid']} --title \"{title}\"` with the text on stdin; then run "
+            f"`{PY} launch --sid {s['sid']}`. Desktop app: call mcp__ccd_session__start_session with the `desktop_app` "
+            f"fields it prints (initiation user_asked, context fresh) and tell the user the new session is open. "
+            f"Terminal: give the user the `cli_fallback` line. Both commands are idempotent; do this once.")
+
+
+def context_now(p, s):
+    """Current context size. Returns (tokens or None, pct or None). Transcript tokens work everywhere;
+    the status line percentage (terminal only) is a fallback."""
+    tok = context_tokens(p.get("transcript_path") or s.get("tr"))
+    pct = s.get("pct")
+    if pct is None and tok and gconf().get("window"): pct = 100.0 * tok / float(gconf()["window"])
+    return tok, pct
 
 
 def cmd_hook(a):
@@ -162,20 +189,25 @@ def cmd_hook(a):
     if ev == "Stop":
         if b: archive(sid, p.get("transcript_path"), b, pid)
         return
-    f = sess_file(sid); s = jload(f)
-    if (not s or s.get("pct") is None) and gconf().get("window"):  # opt-in fallback when no status line signal
-        s = s or {"sid": sid, "state": "none", "events": 0}; s["pct"] = estimate_pct(p.get("transcript_path"), float(gconf()["window"])); s["tr"] = p.get("transcript_path")
-        if s["pct"] is None: return
-    if not s or s.get("pct") is None: return
-    thr = threshold(b); pct = float(s["pct"])
-    if s.get("state") == "requested" and pct < thr - 15: s["state"] = "none"; s["events"] = 0
-    if pct >= thr and s.get("state") == "none":
+    f = sess_file(sid); s = jload(f, {}) or {}
+    s.setdefault("sid", sid); s.setdefault("state", "none"); s.setdefault("events", 0)
+    if p.get("transcript_path"): s["tr"] = p["transcript_path"]
+    tok, pct = context_now(p, s); lim = token_limit(b); thr = threshold(b)
+    s["tokens"] = tok
+    if lim > 0:  # absolute token trigger (default 400k)
+        if tok is None: return jsave(f, s)
+        over, low = tok >= lim, tok < lim * 0.8
+    else:        # percentage trigger (needs the status line or "window")
+        if pct is None: return jsave(f, s)
+        over, low = pct >= thr, pct < thr - 15
+    if s["state"] in ("requested", "written") and low: s["state"] = "none"; s["events"] = 0  # context shrank (compact)
+    if over and s["state"] == "none":
         s["state"] = "requested"; s["events"] = 0; jsave(f, s)
-        return out_ctx(ev, checkpoint_text(s, thr, b))
-    if s.get("state") == "requested":
-        s["events"] = s.get("events", 0) + 1
-        if s["events"] == 15: jsave(f, s); return out_ctx(ev, "[continuity] Checkpoint still pending: " + checkpoint_text(s, thr, b)[14:])
-        jsave(f, s)
+        return out_ctx(ev, checkpoint_text(s, b))
+    if s["state"] == "requested":
+        s["events"] += 1
+        if s["events"] % 15 == 0: jsave(f, s); return out_ctx(ev, "[continuity] Rollover still pending. " + checkpoint_text(s, b)[14:])
+    jsave(f, s)
 
 
 def hook_start(p, sid, pid, b):
@@ -184,25 +216,30 @@ def hook_start(p, sid, pid, b):
     with lock(f"t-{pid}"):
         t = jload(tf)
         if not t or t.get("status") not in ("ready", "launched") or t.get("sid") == sid or time.time() - t.get("created", 0) > 3 * 86400:
-            return out_ctx("SessionStart", "[continuity] active. " + ("Project bound; keep the state note current; user can say \"checkpoint\"." if b else "Project not bound: on first real work use the continuity skill to ask where notes go.") )
-        text = re.sub(r"\A---.*?---\n", "", Path(t["handoff"]).read_text(), count=1, flags=re.S)[:3500] if Path(t["handoff"]).exists() else ""
-        if not text: return out_ctx("SessionStart", "[continuity] active.")
+            return  # nothing to continue: stay silent; the per-message hooks handle rollover on their own
+        text = re.sub(r"\A---.*?---\n", "", Path(t["handoff"]).read_text(encoding="utf-8"), count=1, flags=re.S)[:3500] if Path(t["handoff"]).exists() else ""
+        if not text: return
         t.update(status="claimed", successor=sid, claimed=time.time()); jsave(tf, t)
     note = (pdir(b) / "current-state.md") if b else None
     out_ctx("SessionStart", f"[continuity] Continuing '{t.get('title')}'. Handoff {t['handoff']} (read, claimed). "
             f"State note: {note}. Do not re-launch anything listed as running; fetch more only if needed.\n\n{text}")
 
 
-def estimate_pct(tr, window):
+def context_tokens(tr):
+    """Tokens in the context at the last main-chain assistant turn (input + cache read + cache write)."""
+    if not tr: return None
     try:
         with open(tr, "rb") as f:
-            f.seek(0, 2); f.seek(max(0, f.tell() - 400000)); lines = f.read().splitlines()
-        for l in reversed(lines):
-            if b'"usage"' in l:
-                u = (json.loads(l).get("message") or {}).get("usage") or {}
-                n = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                if n: return 100.0 * n / window
-    except Exception: pass
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 2_000_000)); lines = f.read().splitlines()
+    except OSError: return None
+    for l in reversed(lines):
+        if b'"usage"' not in l: continue
+        try: r = json.loads(l)
+        except Exception: continue  # first line of the tail window can be cut
+        if r.get("isSidechain") or r.get("type") != "assistant": continue
+        u = (r.get("message") or {}).get("usage") or {}
+        n = u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+        if n: return n
     return None
 
 
@@ -231,16 +268,22 @@ def archive(sid, tr, b, pid):
         t = keep_text(r.get("message") or {})
         if t: chunks.append(f"\n### {'User' if r['type']=='user' else 'Assistant'} · {r.get('timestamp','')}\n{redact(t)}\n")
     if not dest.exists():
-        dest.write_text(f"---\nsession_id: {sid}\nproject_id: {pid}\ntitle: {title}\n---\n# Transcript: {title}\n(User prompts and assistant replies only. Secrets redacted.)\n")
+        dest.write_text(f"---\nsession_id: {sid}\nproject_id: {pid}\ntitle: {title}\n---\n# Transcript: {title}\n(User prompts and assistant replies only. Secrets redacted.)\n", encoding="utf-8")
     if chunks:
-        with open(dest, "a") as f: f.write("".join(chunks))
+        with open(dest, "a", encoding="utf-8") as f: f.write("".join(chunks))
     jsave(offf, {"pos": pos + end, "title": title}); return dest
 
 
 # ---------------------------------------------------------------- bind / status
 def vaults():
-    j = jload(HOME / "Library/Application Support/obsidian/obsidian.json", {}) or {}
-    return [v["path"] for v in j.get("vaults", {}).values() if os.path.isdir(v.get("path", ""))]
+    cands = [HOME / "Library/Application Support/obsidian/obsidian.json",  # macOS
+             Path(os.environ.get("APPDATA", HOME / "AppData/Roaming")) / "obsidian/obsidian.json",  # Windows
+             Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "obsidian/obsidian.json"]  # Linux
+    out = []
+    for c in cands:
+        j = jload(c, {}) or {}
+        out += [v["path"] for v in j.get("vaults", {}).values() if os.path.isdir(v.get("path", "")) and v["path"] not in out]
+    return out
 
 
 def cmd_suggest(a):
@@ -265,7 +308,7 @@ def cmd_bind(a):
 def cmd_status(a):
     root = project_root(a.cwd); pid = pid_of(root); b = binding(pid)
     print(json.dumps({"project_id": pid, "root": root, "bound": bool(b), "dir": str(pdir(b)) if b else None,
-                      "threshold": threshold(b), "enabled": enabled(b), "transition": jload(trans_file(pid))}, indent=1))
+                      "threshold_tokens": token_limit(b), "threshold_pct": threshold(b), "enabled": enabled(b), "transition": jload(trans_file(pid))}, indent=1))
 
 
 def cmd_threshold(a):
@@ -285,8 +328,10 @@ def cmd_toggle(a):
     print(a.cmd + "d", a.scope)
 
 
-def need_bound(a):
+def need_bound(a, fallback=False):
     root = project_root(a.cwd); pid = pid_of(root); b = binding(pid)
+    if not b and fallback:  # automatic rollover must not stall on a question: keep handoffs in local state
+        b = {"vault": str(STATE / "projects" / pid), "folder": "notes", "project": os.path.basename(root), "root": root}
     if not b: sys.exit("project not bound: run `suggest`, ask the user once, then `bind`")
     return root, pid, b
 
@@ -308,14 +353,14 @@ def render_note(pid, name, secs):
 
 def cmd_note(a):
     root, pid, b = need_bound(a); f = pdir(b) / "current-state.md"
-    secs = parse_note(f.read_text()) if f.exists() else {k: "" for k in SECTIONS}
-    if a.action == "show": print(f.read_text() if f.exists() else "(no note yet)"); return
+    secs = parse_note(f.read_text(encoding="utf-8")) if f.exists() else {k: "" for k in SECTIONS}
+    if a.action == "show": print(f.read_text(encoding="utf-8") if f.exists() else "(no note yet)"); return
     if a.action == "set":
-        text = redact((a.text if a.text is not None else sys.stdin.read()).strip())
+        text = redact((a.text if a.text is not None else stdin_text()).strip())
         if a.section not in SECTIONS: sys.exit("section must be one of: " + ", ".join(SECTIONS))
         secs[a.section] = (secs[a.section] + "\n" + text).strip() if a.append and secs[a.section] not in ("", "-") else text
     f.parent.mkdir(parents=True, exist_ok=True); tmp = f.with_suffix(".tmp")
-    tmp.write_text(render_note(pid, b["project"], secs)); os.replace(tmp, f); print("updated", f)
+    tmp.write_text(render_note(pid, b["project"], secs), encoding="utf-8"); os.replace(tmp, f); print("updated", f)
 
 
 # ---------------------------------------------------------------- handoff / launch
@@ -333,18 +378,18 @@ def resolve_sid(a):
 def cmd_handoff(a):
     a.sid = resolve_sid(a)
     if not a.title: a.title = session_title((jload(sess_file(a.sid), {}) or {}).get("tr") or "") or sys.exit("no title found; pass --title")
-    root, pid, b = need_bound(a); sf = sess_file(a.sid); s = jload(sf, {}) or {"sid": a.sid, "state": "none"}
+    root, pid, b = need_bound(a, fallback=True); sf = sess_file(a.sid); s = jload(sf, {}) or {"sid": a.sid, "state": "none"}
     tf = trans_file(pid)
     with lock(f"t-{pid}"):
         t = jload(tf)
         if t and t.get("sid") == a.sid and Path(t["handoff"]).exists():
             print("EXISTS", t["handoff"]); return
-        body = redact(sys.stdin.read().strip()); n = len(body.split())
+        body = redact(stdin_text().strip()); n = len(body.split())
         if n < 20 or n > MAX_HANDOFF_WORDS: sys.exit(f"handoff is {n} words; aim 150-300 (limits 20-{MAX_HANDOFF_WORDS})")
         title = a.title; arch = pdir(b) / "transcripts" / f"{slug(session_title(s.get('tr') or '') or title)}--{a.sid[:8]}.md"
         dest = pdir(b) / "handoffs" / f"{slug(title)}--{a.sid[:8]}.md"; dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(f"---\nproject_id: {pid}\nsession_id: {a.sid}\ntitle: {title}\ncreated: {time.strftime('%Y-%m-%d %H:%M')}\n---\n"
-                        f"# Handoff: {title}\n\n{body}\n\nState note: [[{b['folder']}/current-state]]\nExact wording archive: [[{b['folder']}/transcripts/{arch.stem}]]\n")
+                        f"# Handoff: {title}\n\n{body}\n\nState note: [[{b['folder']}/current-state]]\nExact wording archive: [[{b['folder']}/transcripts/{arch.stem}]]\n", encoding="utf-8")
         jsave(tf, {"status": "ready", "sid": a.sid, "title": title, "handoff": str(dest), "cwd": root, "created": time.time()})
         s["state"] = "written"; jsave(sf, s)
     print("WROTE", dest)
@@ -352,7 +397,7 @@ def cmd_handoff(a):
 
 def cmd_launch(a):
     a.sid = resolve_sid(a)
-    root, pid, b = need_bound(a); tf = trans_file(pid)
+    root, pid, b = need_bound(a, fallback=True); tf = trans_file(pid)
     with lock(f"t-{pid}"):
         t = jload(tf)
         if not t or t.get("sid") != a.sid: sys.exit("no handoff for this session: run `handoff` first")
@@ -374,8 +419,29 @@ def cmd_launch(a):
 def cmd_checkpoint(a):
     root = project_root(a.cwd); pid = pid_of(root); b = binding(pid)
     a.sid = resolve_sid(a)
-    f = sess_file(a.sid); s = jload(f, {}) or {"sid": a.sid, "pct": 0}; s["state"] = "requested"; jsave(f, s)
-    print(checkpoint_text(s, threshold(b), b))
+    f = sess_file(a.sid); s = jload(f, {}) or {"sid": a.sid}; s["state"] = "requested"
+    s["tokens"] = context_tokens(s.get("tr")); jsave(f, s)
+    print(checkpoint_text(s, b, reason=f"{int(s['tokens'] or 0):,} tokens (manual checkpoint)"))
+
+
+def cmd_tokens(a):
+    if a.scope == "global": g = gconf(); g["threshold_tokens"] = a.value; jsave(CONF / "config.json", g); print(f"global token threshold {a.value:g}")
+    else:
+        pid = pid_of(project_root(a.cwd)); b = binding(pid)
+        if not b: sys.exit("project not bound; use --scope global or bind first")
+        b["threshold_tokens"] = a.value; jsave(CONF / "projects" / f"{pid}.json", b); print(f"{pid} token threshold {a.value:g}")
+
+
+def cmd_statusline(a):
+    """Status line wrapper: record context %, then run the user's original status line unchanged."""
+    raw = sys.stdin.buffer.read()
+    with contextlib.suppress(Exception):
+        sys.stdin = __import__("io").TextIOWrapper(__import__("io").BytesIO(raw)); cmd_tap(a)
+    orig = (CONF / "statusline-original.txt")
+    o = orig.read_text(encoding="utf-8").strip() if orig.exists() else ""
+    if o:
+        r = subprocess.run(o, shell=True, input=raw, capture_output=True)
+        sys.stdout.buffer.write(r.stdout)
 
 
 # ---------------------------------------------------------------- find
@@ -383,7 +449,7 @@ def cmd_find(a):
     root, pid, b = need_bound(a); d = pdir(b); terms = [x.lower() for x in a.query.split()]; res = []
     for f in d.rglob("*.md"):
         if "transcripts" in f.parts and not a.transcripts: continue
-        try: lines = f.read_text(errors="replace").splitlines()
+        try: lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError: continue
         low = "\n".join(lines).lower(); hit = sum(t in low for t in terms)
         if hit:
@@ -400,6 +466,8 @@ def main():
     def add(n, fn, **kw):
         p = sp.add_parser(n, **kw); p.add_argument("--cwd", default=os.getcwd()); p.set_defaults(fn=fn); return p
     add("tap", cmd_tap)
+    add("statusline", cmd_statusline)
+    p = add("tokens", cmd_tokens); p.add_argument("value", type=float, help="0 = use the percent threshold instead"); p.add_argument("--scope", choices=["project", "global"], default="project")
     add("hook", cmd_hook).add_argument("event")
     add("suggest", cmd_suggest)
     p = add("bind", cmd_bind); p.add_argument("--vault", required=True); p.add_argument("--folder", required=True); p.add_argument("--threshold", type=float)
@@ -416,7 +484,7 @@ def main():
     try: a.fn(a)
     except BrokenPipeError: pass
     except Exception as e:
-        if a.cmd in ("tap", "hook"): return  # never break the host session
+        if a.cmd in ("tap", "hook", "statusline"): return  # never break the host session
         raise
 
 
